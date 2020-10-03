@@ -1,0 +1,719 @@
+#*******************************************************************************
+# Name: SharePoint Patch Reconciler
+# Author: Ed Barnes (edb)
+# Copyright (c) Microsoft Corporation
+# 
+# Utility for SharePoint patch maintenance tasks 
+# "view, log, repair cache, apply"
+# Derived in part from OPUTIL.vbs
+#*******************************************************************************
+$scriptversion = "2020.09.28"
+$scriptname = "SharePoint Patch Reconciler v.$scriptversion"
+$scriptpath = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$hostname = $host.Name
+$islocaladmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+function Pausing { if ($host.name -eq 'ConsoleHost'){ Write-Host "Press Enter to continue..."; While($($host.UI.RawUI.ReadKey().VirtualKeyCode -ne 13)){} } }
+
+if ($hostname -eq 'ConsoleHost'){$thisscript = $MyInvocation.MyCommand.Definition
+    $pshost = Get-Host
+    $pswindow = $pshost.ui.RawUI
+    $orgbufsize = $pswindow.BufferSize; $orgwinsize = $pswindow.WindowSize; 
+    $orgbcolor = $pswindow.BackgroundColor; $orgfcolor = $pswindow.ForegroundColor; 
+    if (!$islocaladmin) { 
+        if ($thisscript -eq $null) { Write-Host "This script must be run elevated"; Pausing ; exit }
+        else { Start-Process powershell.exe "-NoProfile -NoExit -ExecutionPolicy Bypass -File `"$thisscript`"" -Verb RunAs; exit }
+    }
+    $newbufsize = $pswindow.BufferSize; $newbufsize.Height = $pswindow.WindowSize.Height;
+    if ($newbufsize.Height -lt 200) {$newbufsize.Height = 3000}
+    if ($newbufsize.Width -lt 210) {$newbufsize.Width = 210}
+    $newwinsize = $pswindow.WindowSize; $newwinsize.Height = $pswindow.WindowSize.Height; $newwinsize.Width = $newbufsize.Width
+    $pswindow.BufferSize = $newbufsize; $pswindow.WindowSize = $newwinsize; $pswindow.WindowTitle = $scriptname; $pswindow.ForegroundColor = "Black"; $pswindow.BackgroundColor = "White"
+} 
+cls
+if (!$islocaladmin) {Write-Host "This script must be run elevated" ; exit }
+$agreeprompt = "This script will automatically attempt to replace missing installation files."
+$agreeprompt += "`n`nIf updates are missing you will be prompted before any installation is attempted.  "
+$agreeprompt += "A current backup is highly recommended before installing updates."
+$agreeprompt += "`n`nContinue with script?"
+try {
+    Add-Type -AssemblyName PresentationFramework # for MsgBox Confirmation to continue
+    if ( [System.Windows.MessageBox]::Show($agreeprompt,$scriptname,'YesNo','Question') -ne 'Yes'){exit}
+} catch {
+    $response = Read-Host -Prompt ($agreeprompt + " (y/n)")
+    if ( $response -ne 'y'){exit}
+}
+
+$WindowsInstaller = @'
+    [DllImport("msi.dll", SetLastError = true)]
+    static extern uint MsiGetProductInfo(string szProductCode, string szAttribute, [Out] System.Text.StringBuilder lpValueBuf, ref uint pcchValueBuf);
+    public static string GetProductInfo(string productcode, string attribute)
+    {
+        uint rv; uint pcchValueBuf = 1024*1024; System.Text.StringBuilder returnValue = new System.Text.StringBuilder((int)pcchValueBuf);
+        rv = MsiGetProductInfo( productcode, attribute, returnValue, ref pcchValueBuf );
+        if (rv != 0) { Console.Write("Error: {0}", rv ); }
+        return returnValue.ToString();
+    }
+    
+    [DllImport("Msi.dll", SetLastError = true)]
+    static extern uint MsiGetPatchInfoEx(string szPatchCode, string szProductCode, string szUserSid, int dwContext, string szProperty, [Out] System.Text.StringBuilder lpValue, ref uint pcchValue );
+    public static string GetPatchInfo(string patchcode, string productcode, string property)
+    {
+        uint rv; uint pcchValue = 0; System.Text.StringBuilder returnValue = new System.Text.StringBuilder((int)pcchValue);
+        rv = MsiGetPatchInfoEx( patchcode, productcode, null, 4, property, returnValue, ref pcchValue );
+        // first call is with 0 length so that second call uses right-sized buffer
+        returnValue = new System.Text.StringBuilder((int)pcchValue);
+        rv = MsiGetPatchInfoEx( patchcode, productcode, null, 4, property, returnValue, ref pcchValue );
+        return returnValue.ToString();
+    }
+    public static string GetPatchState(string patchcode, string productcode)
+    {
+        uint rv; uint pcchValue = 2; string sReturn = "Unknown";
+        System.Text.StringBuilder returnValue = new System.Text.StringBuilder((int)pcchValue);
+        rv = MsiGetPatchInfoEx( patchcode, productcode, null, 4, "State", returnValue, ref pcchValue );
+        if (rv == 0 ) {
+            switch (returnValue.ToString())
+            {
+                case "1":
+                    sReturn = "Installed"; break;
+                case "2":
+                    sReturn = "Superseded"; break;
+                default:
+                    sReturn = "Unknown"; break;
+            }
+        } else if  (rv == 1647 ) {  sReturn = "Missing/Required";
+        } else { sReturn = System.String.Format("Error: {0}", rv ); }
+        return sReturn;
+    }
+
+'@ 
+
+Add-Type -MemberDefinition $WindowsInstaller  -Namespace WI -Name WinAPI 
+
+$scriptprefix = "SPRecon" #$MyInvocation.MyCommand.Name.Split(".")[0]
+$logbase = $env:TEMP + "\_" + $scriptprefix + "_" + $env:COMPUTERNAME + "_"  + (Get-Date -Format yyMMddhhmm)
+$logfile = "$($logbase).log"
+$errlogfile = "$($logbase)_err.log"
+$tab = " " * 4
+
+function Write-ToLog()
+{   param( $msg = "" )
+    $outstring = $($msg + "|").Split("|")
+    if($outstring[0].Length -gt 0) {Write-Host $outstring[0]}
+    Add-Content $logfile -Value ($msg.Replace("|",""))
+}
+
+function Write-ToLogError()
+{   param( $msg = "" )
+    $outstring = $($msg + "|").Split("|")
+    if($outstring[0].Length -gt 0) {Write-Host $outstring[0] -ForegroundColor White -BackgroundColor Red}
+    Add-Content $logfile -Value (">>>>> ERROR <<<<<$tab" + $msg.Replace("|","") + "$tab<<<<")
+}
+
+function Write-ToLogWarn()
+{   param( $msg = "" )
+    $outstring = $($msg + "|").Split("|")
+    if($outstring[0].Length -gt 0) {Write-Host $outstring[0] -ForegroundColor Yellow -BackgroundColor Black}
+    Add-Content $logfile -Value (">>>>> WARNING <<<<<$tab" + $msg.Replace("|","") + "$tab<<<<")
+}
+
+Add-PSSnapin Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue
+
+try { $osverstring = $(Get-CimInstance Win32_OperatingSystem).Version }
+catch{ $osverstring = [environment]::OSVersion.Version.ToString() } 
+
+# Initialization of variables
+$missingitems = $false
+$pathInstaller = "\Windows\Installer\"
+$sourcepath = $pathRoot + $pathInstaller 
+$additionalsrcpath = ""
+[guid] $localserverid = "11111111-1111-1111-1111-111111111111"
+$localservername = $env:COMPUTERNAME
+$misslist = @()
+$sources = @()
+$brokencache = @()
+$fbrokensrc = $false
+$maxpatchnamelen = 94
+$patchestoapply = @()
+$cfgdbname = ""
+$sqlsrv = ""
+$testforconfigdb = "SELECT CASE WHEN (OBJECT_ID('[dbo].[ServerVersionInformation]')) IS NULL THEN CAST(0 AS BIT) ELSE CAST(1 AS BIT) END"
+Write-ToLog "`r`nThe $scriptname report is running on $env:COMPUTERNAME running Windows $osverstring"
+Write-ToLog "The report is being saved to $logfile"
+Write-ToLog "Drivespace check:"
+$space = Get-WmiObject -Namespace "root/cimv2" -Query "SELECT Name, Capacity, FreeSpace FROM Win32_Volume WHERE Capacity > 0 and (DriveType = 3)" | Select Name,Capacity,Freespace
+$space | ForEach-Object{ 
+    if($_.Name.Length -lt 4){ 
+        $free = $_.Freespace/1GB
+        if ($free -lt 1) {
+            Write-ToLogError ("`t" + ($_.Name) + " Freespace: " + $("{0:n0}" -f ($free) )  + "GB")
+        } else {
+            if ($free -lt 10) {
+                Write-ToLogWarn ("`t" + ($_.Name) + " Freespace: " + $("{0:n0}" -f ($free) )  + "GB")
+            } else {
+                Write-ToLog ("`t" + ($_.Name) + " Freespace: " + $("{0:n0}" -f ($free) ) + "GB" )
+            }
+        }
+    }
+}
+
+# SQL query wrapper
+function RunSql([string] $connstr, [string] $query ){
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection($connstr)
+    $SqlCmd = New-Object System.Data.SqlClient.SqlCommand
+    $SqlCmd.CommandText = $query  
+    $SqlCmd.Connection = $SqlConnection
+    $SqlAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
+    $SqlAdapter.SelectCommand = $SqlCmd
+    $DataSet = New-Object System.Data.DataSet
+    $SqlAdapter.Fill($DataSet) > $null
+    $SqlConnection.Close()
+    return $DataSet.Tables[0]
+}
+
+# Identify DatabaseConnectionString components
+[void][System.Reflection.Assembly]::LoadWithPartialName('Microsoft.VisualBasic')
+try {
+    $cfgdb = (Get-SPDatabase | ?{$_.Type -eq "Configuration Database"})
+    $sqlsrv = $cfgdb.Server.Address
+    $cfgdbname = $cfgdb.Name
+} catch {}
+if($sqlsrv -eq ""){$sqlsrv = [Microsoft.VisualBasic.Interaction]::InputBox("Enter the SQL Server or instance", "Data Source", "")}
+if($sqlsrv -eq ""){exit}
+
+$dcs = "Data Source=$sqlsrv;Integrated Security=True;Connect Timeout=10"
+$TestSqlConnect = New-Object System.Data.SqlClient.SqlConnection($dcs)
+try {
+    $TestSqlConnect.Open()
+    $TestSqlConnect.Close()
+} catch {
+    Write-ToLogWarn "`r`nUnable to connect to the SQL Server $sqlsrv. Please confirm the SQL instance and rerun the script"; Pausing; exit
+}
+$dblist = New-Object System.Data.DataTable
+try{
+    $TestSqlConnect.Open()
+    $dblist = $TestSqlConnect.GetSchema("Databases")
+    $TestSqlConnect.Close()
+} catch {Write-ToLogError "Failed to connect to SQL on $sqlsrv."; exit}
+
+if($cfgdbname -eq ""){
+    $cfgdbs = @()
+    $dblist.rows | ForEach-Object{
+    if($(RunSql "Data Source=$sqlsrv;Initial Catalog=$($_.database_name);Integrated Security=True;Connect Timeout=60" $testforconfigdb)[0]){
+        $cfgdbs += New-Object PSObject -Property @{name="$($_.database_name)"} }
+    }
+    $cfgprompt ="Please enter the Configuration Database name."
+    if($cfgdbs.count -gt 0){ 
+        $cfgprompt +=" Detected:"
+        $cfgdbs | ForEach-Object{$cfgprompt +="`r`n    $($_.Name)"}
+        if($cfgdbs.count -eq 1){$defaultcfgdb = $cfgdbs[0].name}
+    }
+    $cfgdbname = [Microsoft.VisualBasic.Interaction]::InputBox("$cfgprompt", "Configuration Database", $defaultcfgdb)
+}
+if (($sqlsrv.Length -eq 0) -or ($cfgdbname.Length -eq 0)){exit}
+$dcs = "Data Source=$sqlsrv;Initial Catalog=$cfgdbname;Integrated Security=True;Connect Timeout=60"
+
+Write-ToLog "`r`nConfiguration Database: $cfgdbname"
+Write-ToLog "`tConnecting to $cfgdbname on $sqlsrv."
+# Test DataConnection
+try {
+    $TestSqlConnect = New-Object System.Data.SqlClient.SqlConnection($dcs)
+    Write-ToLog "`tConnected to $cfgdbname on $sqlsrv."
+    $TestSqlConnect.Close()
+} catch {Write-ToLogError "Failed to connect to $cfgdbname on $sqlsrv."; exit}
+
+# Build PatchStatus table
+Write-ToLog "`r`nRetrieving Patch Status information from farm..."
+$patchstatustable = New-Object System.Data.Datatable 
+$psquery = "SELECT Product as ServerName, ServerId, Product as ProdGrp, Version,"
+$psquery += " PatchableUnit as ProdCode, PatchableUnitName as ProdName,"
+$psquery += " PatchName as PatchCode, PatchUrl, Flags, CustomData as PatchTitle"
+$psquery += " FROM [dbo].[ServerVersionInformation] (NOLOCK)"
+$patchstatustable = RunSql $dcs $psquery
+Write-ToLog "Buildinging Patch Status reference table..."
+
+# Build server list
+$allservers = @()
+$patchstatustable | Select ServerId -Unique | ForEach-Object {
+    $findnameqry = "SELECT [Name] FROM [$cfgdbname].[dbo].[Objects] (NOLOCK) WHERE Id = '" + $_.ServerId.ToString() + "'"
+    if($($_.ServerId.ToString()).Length -gt 0){
+        $tmpsrvname = $(RunSql $dcs $findnameqry).Name
+        if($($tmpsrvname).Length -gt 0){$allservers += New-Object PSObject -Property @{ServerName = $tmpsrvname; ServerId = $_.ServerId} }
+    }
+    if($tmpsrvname.Split(".")[0] -eq $env:COMPUTERNAME){ $localserverid = $_.ServerId; $localservername = $tmpsrvname }
+}
+if(($localserverid.Guid -eq "11111111-1111-1111-1111-111111111111")){$allservers += New-Object PSObject -Property @{ServerName = $env:COMPUTERNAME; ServerId = $localserverid} }
+
+# Enhance PatchStatus table
+$patchstatustable | ForEach-Object{ 
+    # Add ServerName
+    $srvid = $_.ServerId
+    $_.ServerName = $($allservers | where { $_.ServerId -eq $srvid }).ServerName
+
+    # extract patch displayname from XML
+    [xml] $tmpxml = $($_.PatchTitle | ConvertTo-Xml).Objects.Object.'#text'
+    if($tmpxml -ne $null){$_.PatchTitle = $($tmpxml | Select-XML -XPath "//sFld[@name='m_PatchDisplayName']").ToString() }   
+}
+
+# Identify SharePoint hive
+$buildver = ($patchstatustable | Select Version -First 1).Version.Split(".")[0]
+
+# Identify locally installed Product Groups
+function IsProdGrpInstalled([string] $prodgrp){
+    if($prodgrp -eq $null){return $false}
+    $found = $false
+    # Detect locally installed Product Groups
+    try{
+        $regprogroot = "HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions\$buildver.0\WSS\InstalledProducts"
+        (Get-Item -Path $regprogroot).GetSubKeyNames() | ForEach-Object{
+            if($prodgrp -eq (Get-ItemProperty -Path ("HKLM:" + (Get-ItemProperty -Path ($regprogroot + "\" + $_)).'(default)')).DisplayName){$found = $true}
+        }
+    } catch {}
+    return $found    
+}
+
+# WI guid conversion routine
+function CompressGuid([guid]$guid) {
+    $tmp = $Guid.Guid
+    $t += $tmp.Substring(7, 1) + $tmp.Substring(6, 1) + $tmp.Substring(5, 1) + $tmp.Substring(4, 1)
+    $t += $tmp.Substring(3, 1) + $tmp.Substring(2, 1) + $tmp.Substring(1, 1) + $tmp.Substring(0, 1)
+    $t += $tmp.Substring(12, 1) + $tmp.Substring(11, 1) + $tmp.Substring(10, 1) + $tmp.Substring(9, 1)
+    $t += $tmp.Substring(17, 1) + $tmp.Substring(16, 1) + $tmp.Substring(15, 1) + $tmp.Substring(14, 1)
+    $t += $tmp.Substring(20, 1) + $tmp.Substring(19, 1) + $tmp.Substring(22, 1) + $tmp.Substring(21, 1)
+    $t += $tmp.Substring(25, 1) + $tmp.Substring(24, 1) + $tmp.Substring(27, 1) + $tmp.Substring(26, 1)
+    $t += $tmp.Substring(29, 1) + $tmp.Substring(28, 1) + $tmp.Substring(31, 1) + $tmp.Substring(30, 1)
+    $t += $tmp.Substring(33, 1) + $tmp.Substring(32, 1) + $tmp.Substring(35, 1) + $tmp.Substring(34, 1)
+    return $t.toupper()
+}
+
+# WI guid conversion routine
+function UncompressGuid($compressedguid) {
+    $tmp = $compressedguid
+    $t += $tmp.Substring(7, 1) + $tmp.Substring(6, 1) + $tmp.Substring(5, 1) + $tmp.Substring(4, 1)
+    $t += $tmp.Substring(3, 1) + $tmp.Substring(2, 1) + $tmp.Substring(1, 1) + $tmp.Substring(0, 1) + "-"
+    $t += $tmp.Substring(11, 1) + $tmp.Substring(10, 1) + $tmp.Substring(9, 1) + $tmp.Substring(8, 1) + "-"
+    $t += $tmp.Substring(15, 1) + $tmp.Substring(14, 1) + $tmp.Substring(13, 1) + $tmp.Substring(12, 1)  + "-"
+    $t += $tmp.Substring(17, 1) + $tmp.Substring(16, 1) + $tmp.Substring(19, 1) + $tmp.Substring(18, 1)  + "-"
+    $t += $tmp.Substring(21, 1) + $tmp.Substring(20, 1) + $tmp.Substring(23, 1) + $tmp.Substring(22, 1)
+    $t += $tmp.Substring(25, 1) + $tmp.Substring(24, 1) + $tmp.Substring(27, 1) + $tmp.Substring(26, 1)
+    $t += $tmp.Substring(29, 1) + $tmp.Substring(28, 1) + $tmp.Substring(31, 1) + $tmp.Substring(30, 1) 
+    return [guid]$t.toupper()
+}
+
+# Verify if ProdCode is for an intalled Product (WI automation not good at this)
+function IsProdInstalled([guid] $prod){
+    if($prod -eq $null){return $false}
+    return (Test-Path ("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\" + (CompressGuid $prod) ))
+}
+
+# Identify currentlyinstalled patches for a product (WI automation fails at this)
+function GetInstalledPatches([string] $prod){
+    $regroot = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\" + (CompressGuid $prod) + "\Patches"
+    $prodpatches = @()
+    $patches = (Get-Item -Path $regroot).GetSubKeyNames()
+    $patches | ForEach-Object{
+        $patchprops = Get-ItemProperty -Path ($regroot + "\" + $_)
+        $prodpatches += New-Object PSObject -Property @{PatchCode=$(UncompressGuid $_).Guid; State = $patchprops.State; PatchUrl = $patchprops.MoreInfoUrl ; PatchTitle = $patchprops.DisplayName }
+    }
+    return $prodpatches
+}
+
+# Build Composite of ProdCodes belonging to a Specific Product group
+$farmprodcodes = $patchstatustable | where { $_.PatchCode -eq ""} | Select ProdGrp,Version,ProdCode,ProdName -Unique | Sort-Object ProdCode
+# Augment the patchstatustable with local installation information if local machine is not present (aka un-joined server) 
+$farmprodcodes | ForEach-Object {
+    $tmpProdGrp=$_.ProdGrp;$tmpVersion=$_.Version;$tmpProdCode=$_.ProdCode;$tmpProdName=$_.ProdName
+    if(!(IsProdGrpInstalled $tmpProdGrp)){return}
+    if((IsProdInstalled $tmpProdCode) -and ($localserverid.Guid -eq "11111111-1111-1111-1111-111111111111")){
+        $tmpVersion = $(Get-ItemProperty -Path ("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\" + $tmpProdCode)).DisplayVersion
+        $patchstatustable += New-Object PSObject -Property @{ServerName=$env:COMPUTERNAME;ServerId="11111111-1111-1111-1111-111111111111";ProdGrp=$tmpProdGrp;Version=$tmpVersion;ProdCode=$tmpProdCode;ProdName=$tmpProdName;Flags=2;PatchCode="";PatchUrl="";PatchTitle=""}
+
+        (GetInstalledPatches $tmpProdCode) | ForEach-Object{
+            $tmpPatchCode = $_.PatchCode
+            if($_.State -ne 2){
+                $tmpPatchFlag = 11
+                $tmpPatchVersion = ($patchstatustable | where { $_.PatchCode -eq "{$tmpPatchCode}"} | Select Version -Unique).Version
+                if($tmpPatchVersion -ne $null){$patchstatustable += New-Object PSObject -Property @{ServerName=$env:COMPUTERNAME;ServerId="11111111-1111-1111-1111-111111111111";ProdGrp=$tmpProdGrp;Version=$tmpPatchVersion;ProdCode=$tmpProdCode;ProdName=$tmpProdName;Flags=$tmpPatchFlag;PatchCode="{$tmpPatchCode}";PatchUrl=$_.PatchUrl;PatchTitle=$_.PatchTitle}}
+            }
+        }
+    }
+}
+
+Write-ToLog "Reference table complete"
+
+$wi = New-Object -ComObject WindowsInstaller.Installer
+function GetWIProps([string] $wifilename, [string] $srvid, [string] $verstring){
+    try{
+    if ($wifilename -like "*.msp") {
+        $database = $wi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$Null, $wi, @($wifilename, 32) )
+    } else {
+        $database = $wi.GetType().InvokeMember("OpenDatabase","InvokeMethod",$Null, $wi, @($wifilename, 0) )
+    }
+    $si = $database.GetType().InvokeMember(“SummaryInformation”, “GetProperty”,$Null , $database, $Null)
+    $subject = $si.GetType().InvokeMember(“Property”, “GetProperty”, $null, $si, @(3)) # SummaryInformation Subject
+    $revisionnum = $si.GetType().InvokeMember(“Property”, “GetProperty”, $null, $si, @(9)) # SummaryInformation Revision Number
+    $template = $si.GetType().InvokeMember(“Property”, “GetProperty”, $null, $si, @(7)) # SummaryInformation Template
+    $database = $null; $si = $null
+    return New-Object PSObject -Property @{FileName = $wifilename; Name = $subject; Code = $revisionnum; AppliesTo = $template; ServerId = $srvid; Version = $verstring}
+    } catch { Write-ToLog ("|Problem retrieving information from $wifilename - skipping")
+    }
+}
+
+# Build source list
+function BuildSourceList{
+    [CmdletBinding()] 
+    param(
+        [Parameter(
+            Mandatory=$false,
+            ValueFromPipeline=$true
+            )][string]$AddSrcPath 
+        )
+    Write-ToLog ("`r`nBuilding list of available source files...")
+
+    $global:sources = @()
+    $srcpathprompt = "Paths to use as potential sources:"
+    $allservers | ForEach-Object {
+        $files = @()
+        if ($_.ServerName -like ($env:COMPUTERNAME + "*") ) {$global:localserverid = $_.ServerId; $pathRoot = "C:"} else { $pathRoot = '\\' + $_.ServerName + '\c$'}
+        if(Test-Path "$pathRoot\Windows\Installer"){
+            Write-ToLog ("`tAdding $pathRoot\Windows\Installer")
+            $srcpathprompt += "`r`n    $pathRoot\Windows\Installer"
+            $ServerId = $_.ServerId
+            $files += $(Get-ChildItem "$pathRoot\Windows\Installer" -Filter "*.msi")
+            $files += $(Get-ChildItem "$pathRoot\Windows\Installer" -Filter "*.msp")
+            $files | Foreach-Object { $global:sources +=  GetWIProps $_.FullName -srvid $ServerId}
+        } else {
+            Write-ToLogWarn ("`tUnable to access $pathRoot\Windows\Installer")
+        }
+    }
+    $srcpathprompt += "`n`nWould you like to add another?"
+    $SupplementalSourcePath = [Microsoft.VisualBasic.Interaction]::InputBox("$srcpathprompt", "Supplemental Source Path", $scriptpath)
+    #if ($SupplementalSourcePath.Length -eq 0 ){ $SupplementalSourcePath = $scriptpath} # Include current folder and subfolder as possible sources
+    if ($SupplementalSourcePath.Length -gt 0){
+        $suppfiles = @()
+        if (Test-Path $SupplementalSourcePath){
+            Write-ToLog ("`tAdding $SupplementalSourcePath and all subfolders")
+            $suppfiles += $(Get-ChildItem $SupplementalSourcePath -Filter "*.msi" -Recurse)
+            $suppfiles += $(Get-ChildItem $SupplementalSourcePath -Filter "*.msp" -Recurse)
+            if ($suppfiles -ne $null) { 
+                $ServerId = "00000000-0000-0000-0000-000000000000"
+                $suppfiles | Foreach-Object { $global:sources += GetWIProps $_.FullName -srvid $ServerId }
+            } 
+        }
+    }
+    Write-ToLog ("List of available source files created.`r`n")
+     
+}
+
+function TestWICache{
+    param(
+        [Parameter(Mandatory=$true)][string]$prodcode,
+        [Parameter(Mandatory=$false)][string]$patchcode =""
+    )
+
+    # Return 0 if missing or bad, 1 if current/good, 2 if repaired/good
+    $testresult = 0; $registeredmsicode = ""
+    if($patchcode.Length -eq 0){                                                    # test msi
+        $cachedfile = $([WI.WinAPI]::GetProductInfo($prodcode,'LocalPackage') )
+        $registeredmsicode = $([WI.WinAPI]::GetProductInfo($prodcode,'PackageCode') ) 
+        $wicode = $registeredmsicode
+    } else {                                                                        # test msp 
+        $cachedfile = [WI.WinAPI]::GetPatchInfo($patchcode,$prodcode, 'LocalPackage')
+        $wicode = $patchcode
+    }
+
+    # Read wi info to see if valid wi file
+    if(Test-Path $cachedfile){
+        $cachefileprops = GetWIProps $cachedfile
+        if($cachefileprops -ne $null){$testresult = 1 } # file is present and a wi file
+        if($registeredmsicode.Length -gt 0){  # check if code in msi matches registered code
+            if($cachefileprops.Code -ne $registeredmsicode){ $testresult = 0 }
+        }
+    } else {
+                Write-Debug "missing $cachedfile  $wicode"
+    }
+
+    # if needs repair
+    if($testresult -eq 0){
+        $global:sources | where {$_.Code -eq $wicode} | Sort-Object Filename -Descending | ForEach-Object {
+            if($testresult -eq 0){
+                $srcfile = $_.FileName
+                if ($srcfile -ne $cachedfile){
+                    try {
+                    Write-Debug "copying $srcfile to $cachedfile"
+                        Copy-Item $srcfile -Destination $cachedfile -Force
+                        if(Test-Path $cachedfile){$testresult = 2; return}
+                    } catch {}
+                }
+            }
+        }
+    }
+    return $testresult
+}
+
+function ReconcilePatches{
+    [CmdletBinding()] 
+    param(
+        [Parameter(Mandatory=$false, ValueFromPipeline=$true)][string]$SupplementalSourcePath 
+    )
+
+    if ($SupplementalSourcePath.Length -eq 0 ){ $SupplementalSourcePath = $scriptpath} # Include current folder and subfolder as possible sources
+
+    $allservers | Sort-Object -Property ServerName | ForEach-Object {                                                             # for each server
+        $loopserver = $_
+        $loopserverid = $loopserver.ServerId
+        $loopservername = $loopserver.ServerName
+
+        $fLocal = ($loopserverid -eq $global:localserverid)
+        if($fLocal){$onlytofile = ""} else {$onlytofile = "|"}
+        Write-ToLog ("$onlytofile ")
+        $looppatchstatustable = $patchstatustable | where {$_.ServerId -eq $loopserverid}
+        $farmprodgrps = $patchstatustable | Select ProdGrp -Unique
+        $farmprodgrps | ForEach-Object{                                                                                           # for each Product Group
+            $thisprodgrp = $_.ProdGrp
+            $loopgrouptable = $looppatchstatustable | where {$_.ProdGrp -eq $thisprodgrp} | Sort-Object -Property ProdName -Unique
+            if($loopgrouptable.Count -eq 0){
+                $missingitems = $true
+                Write-ToLogError ($onlytofile + $loopservername + $tab + $($thisprodgrp).PadRight($global:maxpatchnamelen + 20," ") + $tab + "Missing/Required")
+                if(!$fLocal){$global:misslist += New-Object PSObject -Property @{ServerName = $loopservername; Title = "[$thisprodgrp]"}}
+                return
+            } else {
+                Write-ToLog ($onlytofile + $loopservername + $tab + $($thisprodgrp).PadRight($global:maxpatchnamelen + 20," ") + $tab + "Installed")
+
+                # Product group is present so now check products
+                $farmprods = $patchstatustable | where { $_.ProdGrp -eq $thisprodgrp } | Select ProdName,ProdCode -Unique | Sort-Object -Property ProdName
+
+                $farmprods | ForEach-Object{                                                                                      # for each Product 
+                    $thisprodcode = $_.ProdCode; $thisprodname = $_.ProdName
+                    $isprodmissing = (($loopgrouptable | where {$_.ProdCode -eq $thisprodcode} | Select ProdCode -Unique) -eq $null)
+                    $($loopgrouptable | where { ($_.ProdGrp -eq $thisprodgrp) -and ($_.ProdCode -eq $thisprodcode) -and ($_.PatchCode -eq $null)} | Select Version -Unique).Version
+                    $thisprodversion = $($patchstatustable | where { ($_.ServerId -eq $loopserverid) -and ($_.ProdCode -eq $thisprodcode) -and ($_.PatchCode -eq "")} | Select Version -Unique).Version
+                    if(!$isprodmissing){                 # Make sure loop product is at highest version
+                       $highver = $($patchstatustable | where {($_.ProdCode -eq $thisprodcode) -and ($_.PatchCode -eq "")} | Sort-Object -Property Version -Descending | Select Version -First 1 ).Version 
+                       if($thisprodversion -ne $highver){$isprodmissing = $true;} # Write-Host("Expected: $highver - Found: $thisprodversion")
+                    }
+                    if($isprodmissing){
+                        Write-ToLogError ($onlytofile + $loopservername + $tab + $tab + $($thisprodname).PadRight($global:maxpatchnamelen," ") + $tab + $tab + "Missing/Required$tab$tab Please repair [$thisprodgrp]" + "|" + $tab + $thisprodcode)
+                        $global:misslist += New-Object PSObject -Property @{ServerName = $loopservername; Title = $thisprodname}
+                    } else {
+                      
+                        if($fLocal){  # verify cache is good
+                            $registeredprodversion = $([WI.WinAPI]::GetProductInfo($thisprodcode,'VersionString') )
+                            $registeredmsicode = $([WI.WinAPI]::GetProductInfo($thisprodcode,'PackageCode'))
+                            # Check presence of msi
+                            $cachedmsi = $([WI.WinAPI]::GetProductInfo($thisprodcode,'LocalPackage') )
+                            $cachestate = $(TestWICache $thisprodcode)
+                            switch ($cachestate){
+                                0 {   $msistate = "Installed (msi missing)"
+                                      $installsrc = $([WI.WinAPI]::GetProductInfo($thisprodcode,'InstallSource') ) 
+                                      $global:brokencache += New-Object PSObject -Property @{CacheName = $cachedmsi; Code = $registeredmsicode; Reference = "Product`t [$thisprodgrp] (originally installed from $installsrc)"} 
+                                  }
+                                1 {$msistate = "Installed (msi present)"}
+                                2 {$msistate = "Installed (msi repaired)"}
+                            }
+                        } else {
+                            $msistate = "Installed"
+                            $cachestate = -1
+                            $cachedmsi = ""
+                            $cachedmsi = $($sources | where {($_.Name -eq $thisprodname) -and ($_.ServerId -eq $loopserverid) } | Select FileName).FileName 
+                            if ($cachedmsi.Length -eq 0){$cachedmsi = ">>>>> WARNING <<<<< MSI file not found - possible broken cache on remote server"}
+                        }
+                        if($cachestate -eq 0){
+                            Write-ToLogError ($onlytofile + $loopservername + $tab + $tab + $($thisprodname).PadRight($global:maxpatchnamelen," ") + $tab + $thisprodversion + "`t$msistate" + "|" + $tab + $thisprodcode + $tab + $cachedmsi)
+                        } else {
+                            Write-ToLog ($onlytofile + $loopservername + $tab + $tab + $($thisprodname).PadRight($global:maxpatchnamelen," ") + $tab + $thisprodversion + "`t$msistate" + "|" + $tab + $thisprodcode + $tab + $cachedmsi)
+                        }
+
+                        $farmpatches = $patchstatustable | where { ($_.ProdCode -eq $thisprodcode) -and ($_.PatchCode -ne "")} | Sort-Object -Property Version -Descending -Unique
+                        $farmpatches |  ForEach-Object{
+                            $cachedpatch = ""
+                            $thispatchcode = $_.PatchCode; $thispatchurl = $_.PatchUrl; $thispatchtitle = $_.PatchTitle
+                            $ispatchmissing = ($null -eq ($patchstatustable | where {($_.ServerId -eq $loopserverid) -and ($_.ProdCode -eq $thisprodcode) -and ($_.PatchCode -eq $thispatchcode)} ))
+                            if($ispatchmissing -and ($_.Flags -band 16) -eq 16){return}
+                            if(($_.Flags -band 16) -eq 16){$mspstate = "Superseded"} else {$mspstate = "Installed"}  # Flag of 27 = installed but superseded (bitmask of 16), 11 is Installed
+                            if($fLocal){
+ 
+                                if(!$ispatchmissing){                                # Patch is installed
+                                    # check presence of msp
+                                    $cachedpatch = [WI.WinAPI]::GetPatchInfo($thispatchcode,$thisprodcode, 'LocalPackage')
+                                    $cachestate = $(TestWICache $thisprodcode $thispatchcode)
+                                    switch ($cachestate){
+                                        0 {if($mspstate -eq "Installed"){ # if superseded there is no need to recache even if source not available, Get-SPProduct -Local will remove it
+                                                $global:brokencache += New-Object PSObject -Property @{CacheName = $cachedpatch; Code = $thispatchcode; Reference = "Update`t $thispatchurl"}
+                                            }
+                                            $mspstate = "$mspstate (msp missing)"  
+                                          }
+                                        1 {$mspstate = "$mspstate (msp present)"}
+                                        2 {$mspstate = "$mspstate (msp repaired)"}
+                                    }
+                                    if($cachestate -eq 0){
+                                        Write-ToLogError ($onlytofile + $loopservername + $tab + $tab + $tab + $($thispatchtitle).PadRight($global:maxpatchnamelen," ") + $_.Version + "`t$mspstate" + "|" + $tab + $thisprodcode + $tab + $thispatchcode + $tab + $cachedpatch )
+                                    } else {
+                                        Write-ToLog ($onlytofile + $loopservername + $tab + $tab + $tab + $($thispatchtitle).PadRight($global:maxpatchnamelen," ") + $_.Version + "`t$mspstate" + "|" + $tab + $thisprodcode + $tab + $thispatchcode + $tab + $cachedpatch )
+                                    }
+                                } else {
+                                    $missingitems = $true
+                                    $mspstate = "Missing/Required"
+                                    Write-ToLogError ($onlytofile + $loopservername + $tab + $tab + $tab + $thispatchtitle.PadRight($global:maxpatchnamelen," ") + $_.Version + "`t$mspstate`t$thispatchurl" + "|" + $tab + $thisprodcode + $tab + $thispatchcode)
+                                    if($thispatchcode.Length -gt 0){$global:patchestoapply += New-Object PSObject -Property @{Product = $thisprodcode; Code = $thispatchcode; Reference = $thispatchurl; UpdateName = ("[$thisprodname] " + $thispatchtitle);Version = $_.Version; Cmd = " "}}
+                                }
+                            } else {
+                                if(($_.Flags -band 16) -eq 16){$mspstate = "Superseded"} else {$mspstate = "Installed"}
+                                if(!$ispatchmissing){
+                                    $missingitems = $true
+                                    $cachedpatch = $($sources | where {($_.Code -eq $thispatchcode) -and ($_.ServerId -eq $loopserverid) } | Select FileName).FileName 
+                                    if ($cachedpatch.Length -eq 0){$cachedpatch = ">>>>> WARNING <<<<< MSP file not found - possible broken cache on remote server"}
+                                    Write-ToLog ($onlytofile + $loopservername + $tab + $tab + $tab + $thispatchtitle.PadRight($global:maxpatchnamelen," ") + $_.Version + "`t$mspstate" + "|" + $tab + $thisprodcode + $tab + $thispatchcode + $tab + $cachedpatch )
+                                } else {
+                                    $global:misslist += New-Object PSObject -Property @{ServerName = $loopservername; Title = ("[$thisprodname] " + $thispatchtitle)}
+                                    Write-ToLogError ($onlytofile + $loopservername + $tab + $tab + $tab + $thispatchtitle.PadRight($global:maxpatchnamelen," ") + $_.Version + "`tMissing/Required`t$thispatchurl" + "|" + $tab + $thisprodcode + $tab + $thispatchcode + $tab + $cachedpatch )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if($missingitems){
+        $warnstring = "Warning: The farm servers do not currently have the same product and patch level as each other. Upgrade should not be run on any farm server until all farm servers`nhave the same set of required products and patches installed."
+        Write-Host $warnstring -ForegroundColor Red
+    }
+}
+
+function HandleMissingPatches{
+    $rebootrequired = $false
+    #$global:patchestoapply | Export-Csv -Path ($logbase + "_patchestoapply.csv")
+    if ($global:patchestoapply.Count -gt 0 ) {
+        $patchprompt = "There are $($global:patchestoapply.Count) updates missing on this server"
+        Write-ToLog ("`r`n" + $patchprompt + ":")
+        $sortedsources = $sources | Sort-Object -Property FileName -Descending
+        $global:patchestoapply | Sort-Object -Property Version | ForEach-Object{ 
+            $missingcode = $_.Code; $targetprod = $_.Product; $ref = $_.Reference; $patchdisplay = $_.UpdateName; $srcfileName =""
+            $sortedsources | ForEach-Object{if($_.Code -eq $missingcode){$srcfileName = $_.FileName; return}}
+            if ($srcfileName.Length -ne 0) {
+                $sCmd = $(' /i ' + $targetprod + ' PATCH="' + $srcfileName + '" REBOOT=ReallySuppress MSIRESTARTMANAGERCONTROL=Disable /qb- /l*v ')
+                $sCmd = $sCmd + '"' + $env:TEMP + '\_' + $env:COMPUTERNAME + '_' + $targetprod + '_MspApply.log"'
+                $_.Cmd = $sCmd
+                Write-ToLog ("`tSource available`t" + $_.UpdateName)
+            } else {
+                Write-ToLogError ("`tNo source available`t" + $_.UpdateName)
+                Write-ToLogWarn ("`t`tPlease reference " + $ref )
+                $fbrokensrc = $true
+            }
+        }
+
+        $patchestodo = $($global:patchestoapply | where {$_.Cmd.Length -gt 8 })
+        if($patchestodo -ne $null){
+            $continue = $([System.Windows.MessageBox]::Show($patchprompt + ", Install the missing updates?","Apply missing updates",'YesNo','Question') -eq 'Yes')
+            if ($continue){
+                Write-ToLog "`r`nApplying updates:`r`n================"
+            } else { Write-ToLog "`r`nExample commands:`r`n================="}
+            $patchestodo | Sort-Object -Property Version | ForEach-Object {
+                $wicmd = $_.Cmd
+                $missingcode = $_.Code; $targetprod = $_.Product; $ref = $_.Reference; $patchdisplay = $_.UpdateName
+                Write-ToLog " "; Write-ToLog ($patchdisplay + $tab + $ref)
+                Write-ToLog "`tmsiexec.exe $wicmd"
+                if ($continue){
+                    Get-Service | where {$_.Status -eq 'Running' } | where {($_.Name -eq "IISADMIN") -or ($_.Name -eq "W3SVC") -or ($_.Name -eq "SPAdminV4") -or ($_.Name -eq "SPTimerV4") -or ($_.Name -eq "SPTraceV4") -or ($_.Name -eq "SPSearchHostController") -or ($_.Name -like "OSearch*")} | ForEach-Object {$_.Stop()}
+                    $process = Start-Process "msiexec.exe" -ArgumentList $wicmd  -PassThru -Wait
+                    switch ($process.ExitCode){
+                        0      {Write-ToLog "Success"}
+                        1259      {Write-ToLog "Error: $exitcode APPHELP_BLOCK"}
+                        1601      {Write-ToLog "Error: $exitcode INSTALL_SERVICE_FAILURE"}
+                        1602      {Write-ToLog "Error: $exitcode INSTALL_USEREXIT"}
+                        1603      {Write-ToLog "Error: $exitcode INSTALL_FAILURE"}
+                        1604      {Write-ToLog "Error: $exitcode INSTALL_SUSPEND"}
+                        1605      {Write-ToLog "Error: $exitcode UNKNOWN_PRODUCT"}
+                        1606      {Write-ToLog "Error: $exitcode UNKNOWN_FEATURE"}
+                        1607      {Write-ToLog "Error: $exitcode UNKNOWN_COMPONENT"}
+                        1608      {Write-ToLog "Error: $exitcode UNKNOWN_PROPERTY"}
+                        1609      {Write-ToLog "Error: $exitcode INVALID_HANDLE_STATE"}
+                        1610      {Write-ToLog "Error: $exitcode BAD_CONFIGURATION"}
+                        1611      {Write-ToLog "Error: $exitcode INDEX_ABSENT"}
+                        1612      {Write-ToLog "Error: $exitcode INSTALL_SOURCE_ABSENT"}
+                        1613      {Write-ToLog "Error: $exitcode INSTALL_PACKAGE_VERSION"}
+                        1614      {Write-ToLog "Error: $exitcode PRODUCT_UNINSTALLED"}
+                        1615      {Write-ToLog "Error: $exitcode BAD_QUERY_SYNTAX"}
+                        1616      {Write-ToLog "Error: $exitcode INVALID_FIELD"}
+                        1618      {Write-ToLog "Error: $exitcode INSTALL_ALREADY_RUNNING"}
+                        1619      {Write-ToLog "Error: $exitcode INSTALL_PACKAGE_OPEN_FAILED"}
+                        1620      {Write-ToLog "Error: $exitcode INSTALL_PACKAGE_INVALID"}
+                        1621      {Write-ToLog "Error: $exitcode INSTALL_UI_FAILURE"}
+                        1622      {Write-ToLog "Error: $exitcode INSTALL_LOG_FAILURE"}
+                        1623      {Write-ToLog "Error: $exitcode INSTALL_LANGUAGE_UNSUPPORTED"}
+                        1624      {Write-ToLog "Error: $exitcode INSTALL_TRANSFORM_FAILURE"}
+                        1625      {Write-ToLog "Error: $exitcode INSTALL_PACKAGE_REJECTED"}
+                        1626      {Write-ToLog "Error: $exitcode FUNCTION_NOT_CALLED"}
+                        1627      {Write-ToLog "Error: $exitcode FUNCTION_FAILED"}
+                        1628      {Write-ToLog "Error: $exitcode INVALID_TABLE"}
+                        1629      {Write-ToLog "Error: $exitcode DATATYPE_MISMATCH"}
+                        1630      {Write-ToLog "Error: $exitcode UNSUPPORTED_TYPE"}
+                        1631      {Write-ToLog "Error: $exitcode CREATE_FAILED"}
+                        1632      {Write-ToLog "Error: $exitcode INSTALL_TEMP_UNWRITABLE"}
+                        1633      {Write-ToLog "Error: $exitcode INSTALL_PLATFORM_UNSUPPORTED"}
+                        1634      {Write-ToLog "Error: $exitcode INSTALL_NOTUSED"}
+                        1635      {Write-ToLog "Error: $exitcode PATCH_PACKAGE_OPEN_FAILED"}
+                        1636      {Write-ToLog "Error: $exitcode PATCH_PACKAGE_INVALID"}
+                        1637      {Write-ToLog "Error: $exitcode PATCH_PACKAGE_UNSUPPORTED"}
+                        1638      {Write-ToLog "Error: $exitcode PRODUCT_VERSION"}
+                        1639      {Write-ToLog "Error: $exitcode INVALID_COMMAND_LINE"}
+                        1640      {Write-ToLog "Error: $exitcode INSTALL_REMOTE_DISALLOWED"}
+                        1641      {Write-ToLog "Error: $exitcode SUCCESS_REBOOT_INITIATED"}
+                        1642      {Write-ToLog "Error: $exitcode PATCH_TARGET_NOT_FOUND"}
+                        1643      {Write-ToLog "Error: $exitcode PATCH_PACKAGE_REJECTED"}
+                        1644      {Write-ToLog "Error: $exitcode INSTALL_TRANSFORM_REJECTED"}
+                        1645      {Write-ToLog "Error: $exitcode INSTALL_REMOTE_PROHIBITED"}
+                        1646      {Write-ToLog "Error: $exitcode PATCH_REMOVAL_UNSUPPORTED"}
+                        1647      {Write-ToLog "Error: $exitcode UNKNOWN_PATCH"}
+                        1648      {Write-ToLog "Error: $exitcode PATCH_NO_SEQUENCE"}
+                        1649      {Write-ToLog "Error: $exitcode PATCH_REMOVAL_DISALLOWED"}
+                        1650      {Write-ToLog "Error: $exitcode INVALID_PATCH_XML"}
+                        3010      {Write-ToLogError "Error: $exitcode SUCCESS_REBOOT_REQUIRED"; $rebootrequired = $true}
+                        default       {Write-ToLog "Error: $exitcode"}
+                    }
+                    Write-ToLog " "
+                }
+            }
+            if ($rebootrequired){[System.Windows.MessageBox]::Show("Missing updates were installed and a reboot is required. Please reboot!","Update installation complete",'OK','Warning'); Write-ToLogWarn "Reboot Required!"}
+            try{
+                Write-ToLog "`r`nAfter applying patch: 'Get-SPProduct -Local'"; Get-SPProduct -Local | Out-Null
+            } catch {}
+        }
+    }
+}
+
+# Main
+BuildSourceList  2>>$errlogfile
+ReconcilePatches 2>>$errlogfile
+if ($global:patchestoapply.Count -gt 0 ) {
+    HandleMissingPatches 2>>$errlogfile
+} else { Write-ToLog ("`r`nNo missing updates detected on this computer`r`n") }
+
+if ($global:misslist.Count -gt 0 ) {
+    Write-ToLogWarn ("Missing updates detected on other computers") 
+    Write-ToLogWarn ("===========================================") 
+    $global:misslist | ForEach{Write-ToLogWarn ($_.ServerName + "`t" + $_.Title)}
+}
+
+if ($global:brokencache.Count -gt 0 ) {
+    Write-ToLogWarn ("The Windows Installer cache is damaged") 
+    Write-ToLogWarn ("======================================") 
+    Write-ToLogWarn ("One or more files were missing and unable to be restored from the available sources.") 
+    Write-ToLogWarn ("Please add a Supplemental Source Path where installation files may be found for:") 
+    $global:brokencache | Select Reference -Unique | ForEach{Write-ToLogWarn ("`t" + $_.Reference)}
+}
+
+# Log sources
+$sources | Export-Csv -Path ($logbase + "_src.csv")
+#$patchstatustable | Export-Csv -Path ($logbase + "_patchstatus.csv")
+
+if ( (Get-Item -Path $errlogfile).Length -eq 0 ){ Remove-Item $errlogfile }
+
+# Open Explorer window to log location
+Start-Process $($env:windir + "\explorer.exe")  -ArgumentList $(Split-Path -Parent $logfile) 
+
+# Pause and reset host config
+if ($host.name -eq 'ConsoleHost'){ 
+    Pausing
+    $pswindow.WindowTitle = $originaltitle
+}
