@@ -27,4 +27,4 @@ Usage:
 
 
 The tool creates log/work files in %temp% with _SP_Recon_* as part of the name.
-If applying a patch fails, there should be "*_MSPApply" Installer logs to assist in identifying the cause or the failure
+If applying a patch fails, there should be "*_MSPApply*" Installer logs to assist in identifying the cause or the failure
